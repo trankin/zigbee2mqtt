@@ -1,16 +1,45 @@
-import events from 'events';
-events.captureRejections = true;
+import events from 'node:events';
 
-// eslint-disable-next-line
+import logger from './util/logger';
+
 type ListenerKey = object;
 
-export default class EventBus {
-    private callbacksByExtension: { [s: string]: { event: string, callback: (...args: unknown[]) => void }[] } = {};
-    private emitter = new events.EventEmitter();
+interface EventBusMap {
+    adapterDisconnected: [];
+    permitJoinChanged: [data: eventdata.PermitJoinChanged];
+    publishAvailability: [];
+    deviceRenamed: [data: eventdata.EntityRenamed];
+    deviceRemoved: [data: eventdata.EntityRemoved];
+    lastSeenChanged: [data: eventdata.LastSeenChanged];
+    deviceNetworkAddressChanged: [data: eventdata.DeviceNetworkAddressChanged];
+    deviceAnnounce: [data: eventdata.DeviceAnnounce];
+    deviceInterview: [data: eventdata.DeviceInterview];
+    deviceJoined: [data: eventdata.DeviceJoined];
+    entityOptionsChanged: [data: eventdata.EntityOptionsChanged];
+    exposesChanged: [data: eventdata.ExposesChanged];
+    deviceLeave: [data: eventdata.DeviceLeave];
+    deviceMessage: [data: eventdata.DeviceMessage];
+    mqttMessage: [data: eventdata.MQTTMessage];
+    mqttMessagePublished: [data: eventdata.MQTTMessagePublished];
+    publishEntityState: [data: eventdata.PublishEntityState];
+    groupMembersChanged: [data: eventdata.GroupMembersChanged];
+    devicesChanged: [];
+    scenesChanged: [data: eventdata.ScenesChanged];
+    reconfigure: [data: eventdata.Reconfigure];
+    stateChange: [data: eventdata.StateChange];
+}
+type EventBusListener<K> = K extends keyof EventBusMap
+    ? EventBusMap[K] extends unknown[]
+        ? (...args: EventBusMap[K]) => Promise<void> | void
+        : never
+    : never;
 
-    constructor(onError: (error: Error) => void) {
+export default class EventBus {
+    private callbacksByExtension: {[s: string]: {event: keyof EventBusMap; callback: EventBusListener<keyof EventBusMap>}[]} = {};
+    private emitter = new events.EventEmitter<EventBusMap>();
+
+    constructor() {
         this.emitter.setMaxListeners(100);
-        this.emitter.on('error', onError);
     }
 
     public emitAdapterDisconnected(): void {
@@ -27,17 +56,17 @@ export default class EventBus {
         this.on('permitJoinChanged', callback, key);
     }
 
-    public emitDeviceRenamed(data: eventdata.DeviceRenamed): void {
+    public emitEntityRenamed(data: eventdata.EntityRenamed): void {
         this.emitter.emit('deviceRenamed', data);
     }
-    public onDeviceRenamed(key: ListenerKey, callback: (data: eventdata.DeviceRenamed) => void): void {
+    public onEntityRenamed(key: ListenerKey, callback: (data: eventdata.EntityRenamed) => void): void {
         this.on('deviceRenamed', callback, key);
     }
 
-    public emitDeviceRemoved(data: eventdata.DeviceRemoved): void {
+    public emitEntityRemoved(data: eventdata.EntityRemoved): void {
         this.emitter.emit('deviceRemoved', data);
     }
-    public onDeviceRemoved(key: ListenerKey, callback: (data: eventdata.DeviceRemoved) => void): void {
+    public onEntityRemoved(key: ListenerKey, callback: (data: eventdata.EntityRemoved) => void): void {
         this.on('deviceRemoved', callback, key);
     }
 
@@ -51,8 +80,7 @@ export default class EventBus {
     public emitDeviceNetworkAddressChanged(data: eventdata.DeviceNetworkAddressChanged): void {
         this.emitter.emit('deviceNetworkAddressChanged', data);
     }
-    public onDeviceNetworkAddressChanged(
-        key: ListenerKey, callback: (data: eventdata.DeviceNetworkAddressChanged) => void): void {
+    public onDeviceNetworkAddressChanged(key: ListenerKey, callback: (data: eventdata.DeviceNetworkAddressChanged) => void): void {
         this.on('deviceNetworkAddressChanged', callback, key);
     }
 
@@ -75,6 +103,20 @@ export default class EventBus {
     }
     public onDeviceJoined(key: ListenerKey, callback: (data: eventdata.DeviceJoined) => void): void {
         this.on('deviceJoined', callback, key);
+    }
+
+    public emitEntityOptionsChanged(data: eventdata.EntityOptionsChanged): void {
+        this.emitter.emit('entityOptionsChanged', data);
+    }
+    public onEntityOptionsChanged(key: ListenerKey, callback: (data: eventdata.EntityOptionsChanged) => void): void {
+        this.on('entityOptionsChanged', callback, key);
+    }
+
+    public emitExposesChanged(data: eventdata.ExposesChanged): void {
+        this.emitter.emit('exposesChanged', data);
+    }
+    public onExposesChanged(key: ListenerKey, callback: (data: eventdata.ExposesChanged) => void): void {
+        this.on('exposesChanged', callback, key);
     }
 
     public emitDeviceLeave(data: eventdata.DeviceLeave): void {
@@ -126,18 +168,18 @@ export default class EventBus {
         this.on('devicesChanged', callback, key);
     }
 
-    public emitScenesChanged(): void {
-        this.emitter.emit('scenesChanged');
+    public emitScenesChanged(data: eventdata.ScenesChanged): void {
+        this.emitter.emit('scenesChanged', data);
     }
-    public onScenesChanged(key: ListenerKey, callback: () => void): void {
+    public onScenesChanged(key: ListenerKey, callback: (data: eventdata.ScenesChanged) => void): void {
         this.on('scenesChanged', callback, key);
     }
 
-    public emitReportingDisabled(data: eventdata.ReportingDisabled): void {
-        this.emitter.emit('reportingDisabled', data);
+    public emitReconfigure(data: eventdata.Reconfigure): void {
+        this.emitter.emit('reconfigure', data);
     }
-    public onReportingDisabled(key: ListenerKey, callback: (data: eventdata.ReportingDisabled) => void): void {
-        this.on('reportingDisabled', callback, key);
+    public onReconfigure(key: ListenerKey, callback: (data: eventdata.Reconfigure) => void): void {
+        this.on('reconfigure', callback, key);
     }
 
     public emitStateChange(data: eventdata.StateChange): void {
@@ -147,14 +189,30 @@ export default class EventBus {
         this.on('stateChange', callback, key);
     }
 
-    private on(event: string, callback: (...args: unknown[]) => void, key: ListenerKey): void {
-        if (!this.callbacksByExtension[key.constructor.name]) this.callbacksByExtension[key.constructor.name] = [];
-        this.callbacksByExtension[key.constructor.name].push({event, callback});
-        this.emitter.on(event, callback);
+    public emitExposesAndDevicesChanged(device: Device): void {
+        this.emitDevicesChanged();
+        this.emitExposesChanged({device});
+    }
+
+    private on<K extends keyof EventBusMap>(event: K, callback: EventBusListener<K>, key: ListenerKey): void {
+        if (!this.callbacksByExtension[key.constructor.name]) {
+            this.callbacksByExtension[key.constructor.name] = [];
+        }
+
+        const wrappedCallback = async (...args: never[]): Promise<void> => {
+            try {
+                await callback(...args);
+            } catch (error) {
+                logger.error(`EventBus error '${key.constructor.name}/${event}': ${(error as Error).message}`);
+                logger.debug((error as Error).stack!);
+            }
+        };
+
+        this.callbacksByExtension[key.constructor.name].push({event, callback: wrappedCallback});
+        this.emitter.on(event, wrappedCallback as EventBusListener<K>);
     }
 
     public removeListeners(key: ListenerKey): void {
-        this.callbacksByExtension[key.constructor.name]?.forEach(
-            (e) => this.emitter.removeListener(e.event, e.callback));
+        this.callbacksByExtension[key.constructor.name]?.forEach((e) => this.emitter.removeListener(e.event, e.callback));
     }
 }

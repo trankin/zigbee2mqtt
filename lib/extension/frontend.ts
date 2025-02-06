@@ -1,81 +1,170 @@
-import http from 'http';
-import serveStatic from 'serve-static';
+import type {IncomingMessage, Server, ServerResponse} from 'node:http';
+import type {Socket} from 'node:net';
+
+import type {RequestHandler} from 'express-static-gzip';
+
+import assert from 'node:assert';
+import {existsSync, readFileSync} from 'node:fs';
+import {createServer} from 'node:http';
+import {createServer as createSecureServer} from 'node:https';
+import {posix} from 'node:path';
+import {parse} from 'node:url';
+
+import bind from 'bind-decorator';
+import expressStaticGzip from 'express-static-gzip';
 import finalhandler from 'finalhandler';
-import logger from '../util/logger';
-import frontend from 'zigbee2mqtt-frontend';
+import stringify from 'json-stable-stringify-without-jsonify';
 import WebSocket from 'ws';
-import net from 'net';
-import url from 'url';
+
+import frontend from 'zigbee2mqtt-frontend';
+
+import data from '../util/data';
+import logger from '../util/logger';
 import * as settings from '../util/settings';
 import utils from '../util/utils';
-import stringify from 'json-stable-stringify-without-jsonify';
 import Extension from './extension';
-import bind from 'bind-decorator';
 
 /**
  * This extension servers the frontend
  */
 export default class Frontend extends Extension {
-    private mqttBaseTopic = settings.get().mqtt.base_topic;
-    private host = settings.get().frontend.host || '0.0.0.0';
-    private port = settings.get().frontend.port || 8080;
-    private authToken = settings.get().frontend.auth_token || false;
-    private retainedMessages = new Map();
-    private server: http.Server;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    private fileServer: serveStatic.RequestHandler<any>;
-    private wss: WebSocket.Server = null;
+    private mqttBaseTopic: string;
+    private host: string | undefined;
+    private port: number;
+    private sslCert: string | undefined;
+    private sslKey: string | undefined;
+    private authToken: string | undefined;
+    private server!: Server;
+    private fileServer!: RequestHandler;
+    private deviceIconsFileServer!: RequestHandler;
+    private wss!: WebSocket.Server;
+    private baseUrl: string;
 
-    constructor(zigbee: Zigbee, mqtt: MQTT, state: State, publishEntityState: PublishEntityState,
-        eventBus: EventBus, enableDisableExtension: (enable: boolean, name: string) => Promise<void>,
-        restartCallback: () => void, addExtension: (extension: Extension) => void) {
+    constructor(
+        zigbee: Zigbee,
+        mqtt: MQTT,
+        state: State,
+        publishEntityState: PublishEntityState,
+        eventBus: EventBus,
+        enableDisableExtension: (enable: boolean, name: string) => Promise<void>,
+        restartCallback: () => Promise<void>,
+        addExtension: (extension: Extension) => Promise<void>,
+    ) {
         super(zigbee, mqtt, state, publishEntityState, eventBus, enableDisableExtension, restartCallback, addExtension);
-        this.eventBus.onMQTTMessagePublished(this, this.onMQTTPublishMessage);
+
+        const frontendSettings = settings.get().frontend;
+        assert(frontendSettings.enabled, `Frontend extension created with setting 'enabled: false'`);
+        this.host = frontendSettings.host;
+        this.port = frontendSettings.port;
+        this.sslCert = frontendSettings.ssl_cert;
+        this.sslKey = frontendSettings.ssl_key;
+        this.authToken = frontendSettings.auth_token;
+        this.baseUrl = frontendSettings.base_url;
+        this.mqttBaseTopic = settings.get().mqtt.base_topic;
+    }
+
+    private isHttpsConfigured(): boolean {
+        if (this.sslCert && this.sslKey) {
+            if (!existsSync(this.sslCert) || !existsSync(this.sslKey)) {
+                logger.error(`defined ssl_cert '${this.sslCert}' or ssl_key '${this.sslKey}' file path does not exists, server won't be secured.`);
+                return false;
+            }
+            return true;
+        }
+        return false;
     }
 
     override async start(): Promise<void> {
-        this.server = http.createServer(this.onRequest);
-        this.server.on('upgrade', this.onUpgrade);
+        const options = {
+            enableBrotli: true,
+            // TODO: https://github.com/Koenkk/zigbee2mqtt/issues/24654 - enable compressed index serving when express-static-gzip is fixed.
+            index: false,
+            serveStatic: {
+                index: 'index.html',
+                /* v8 ignore start */
+                setHeaders: (res: ServerResponse, path: string): void => {
+                    if (path.endsWith('index.html')) {
+                        res.setHeader('Cache-Control', 'no-store');
+                    }
+                },
+                /* v8 ignore stop */
+            },
+        };
+        this.fileServer = expressStaticGzip(frontend.getPath(), options);
+        this.deviceIconsFileServer = expressStaticGzip(data.joinPath('device_icons'), options);
+        this.wss = new WebSocket.Server({noServer: true, path: posix.join(this.baseUrl, 'api')});
 
-        /* istanbul ignore next */ // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const options = {setHeaders: (res: any, path: any): void => {
-            if (path.endsWith('index.html')) {
-                res.setHeader('Cache-Control', 'no-store');
-            }
-        }};
-
-        this.fileServer = serveStatic(frontend.getPath(), options);
-        this.wss = new WebSocket.Server({noServer: true});
         this.wss.on('connection', this.onWebSocketConnection);
 
-        this.server.listen(this.port, this.host);
-        logger.info(`Started frontend on port ${this.host}:${this.port}`);
+        if (this.isHttpsConfigured()) {
+            const serverOptions = {
+                key: readFileSync(this.sslKey!), // valid from `isHttpsConfigured`
+                cert: readFileSync(this.sslCert!), // valid from `isHttpsConfigured`
+            };
+            this.server = createSecureServer(serverOptions, this.onRequest);
+        } else {
+            this.server = createServer(this.onRequest);
+        }
+
+        this.server.on('upgrade', this.onUpgrade);
+        this.eventBus.onMQTTMessagePublished(this, this.onMQTTPublishMessage);
+
+        if (!this.host) {
+            this.server.listen(this.port);
+            logger.info(`Started frontend on port ${this.port}`);
+        } else if (this.host.startsWith('/')) {
+            this.server.listen(this.host);
+            logger.info(`Started frontend on socket ${this.host}`);
+        } else {
+            this.server.listen(this.port, this.host);
+            logger.info(`Started frontend on port ${this.host}:${this.port}`);
+        }
     }
 
     override async stop(): Promise<void> {
-        super.stop();
-        for (const client of this.wss.clients) {
+        await super.stop();
+        this.wss?.clients.forEach((client) => {
             client.send(stringify({topic: 'bridge/state', payload: 'offline'}));
             client.terminate();
+        });
+        this.wss?.close();
+
+        await new Promise((resolve) => this.server?.close(resolve));
+    }
+
+    @bind private onRequest(request: IncomingMessage, response: ServerResponse): void {
+        const fin = finalhandler(request, response);
+        const newUrl = posix.relative(this.baseUrl, request.url!);
+
+        // The request url is not within the frontend base url, so the relative path starts with '..'
+        if (newUrl.startsWith('.')) {
+            return fin();
         }
-        this.wss.close();
-        return new Promise((cb: () => void) => this.server.close(cb));
+
+        // Attach originalUrl so that static-server can perform a redirect to '/' when serving the root directory.
+        // This is necessary for the browser to resolve relative assets paths correctly.
+        request.originalUrl = request.url;
+        request.url = '/' + newUrl;
+        request.path = request.url;
+
+        if (newUrl.startsWith('device_icons/')) {
+            request.path = request.path.replace('device_icons/', '');
+            request.url = request.url.replace('/device_icons', '');
+            this.deviceIconsFileServer(request, response, fin);
+        } else {
+            this.fileServer(request, response, fin);
+        }
     }
 
-    @bind private onRequest(request: http.IncomingMessage, response: http.ServerResponse): void {
-        // @ts-ignore
-        this.fileServer(request, response, finalhandler(request, response));
-    }
-
-    private authenticate(request: http.IncomingMessage, cb: (authenticate: boolean) => void): void {
-        const {query} = url.parse(request.url, true);
+    private authenticate(request: IncomingMessage, cb: (authenticate: boolean) => void): void {
+        const {query} = parse(request.url!, true);
         cb(!this.authToken || this.authToken === query.token);
     }
 
-    @bind private onUpgrade(request: http.IncomingMessage, socket: net.Socket, head: Buffer): void {
+    @bind private onUpgrade(request: IncomingMessage, socket: Socket, head: Buffer): void {
         this.wss.handleUpgrade(request, socket, head, (ws) => {
-            this.authenticate(request, (isAuthentificated) => {
-                if (isAuthentificated) {
+            this.authenticate(request, (isAuthenticated) => {
+                if (isAuthenticated) {
                     this.wss.emit('connection', ws, request);
                 } else {
                     ws.close(4401, 'Unauthorized');
@@ -85,28 +174,33 @@ export default class Frontend extends Extension {
     }
 
     @bind private onWebSocketConnection(ws: WebSocket): void {
+        ws.on('error', (msg) => logger.error(`WebSocket error: ${msg.message}`));
         ws.on('message', (data: Buffer, isBinary: boolean) => {
             if (!isBinary && data) {
                 const message = data.toString();
                 const {topic, payload} = JSON.parse(message);
-                this.mqtt.onMessage(`${this.mqttBaseTopic}/${topic}`, stringify(payload));
+                this.mqtt.onMessage(`${this.mqttBaseTopic}/${topic}`, Buffer.from(stringify(payload)));
             }
         });
 
-        for (const [key, value] of this.retainedMessages) {
-            ws.send(stringify({topic: key, payload: value}));
+        for (const [topic, payload] of Object.entries(this.mqtt.retainedMessages)) {
+            if (topic.startsWith(`${this.mqttBaseTopic}/`)) {
+                ws.send(
+                    stringify({
+                        // Send topic without base_topic
+                        topic: topic.substring(this.mqttBaseTopic.length + 1),
+                        payload: utils.parseJSON(payload.payload, payload.payload),
+                    }),
+                );
+            }
         }
 
-        for (const device of this.zigbee.devices(false)) {
-            let payload: KeyValue = {};
-            if (this.state.exists(device)) {
-                payload = {...payload, ...this.state.get(device)};
-            }
-
+        for (const device of this.zigbee.devicesIterator(utils.deviceNotCoordinator)) {
+            const payload = this.state.get(device);
             const lastSeen = settings.get().advanced.last_seen;
-            /* istanbul ignore if */
+
             if (lastSeen !== 'disable') {
-                payload.last_seen = utils.formatDate(device.zh.lastSeen, lastSeen);
+                payload.last_seen = utils.formatDate(device.zh.lastSeen ?? /* v8 ignore next */ 0, lastSeen);
             }
 
             if (device.zh.linkquality !== undefined) {
@@ -122,16 +216,10 @@ export default class Frontend extends Extension {
             // Send topic without base_topic
             const topic = data.topic.substring(this.mqttBaseTopic.length + 1);
             const payload = utils.parseJSON(data.payload, data.payload);
-            if (data.options.retain) {
-                this.retainedMessages.set(topic, payload);
-            }
 
-            if (this.wss) {
-                for (const client of this.wss.clients) {
-                    /* istanbul ignore else */
-                    if (client.readyState === WebSocket.OPEN) {
-                        client.send(stringify({topic, payload}));
-                    }
+            for (const client of this.wss.clients) {
+                if (client.readyState === WebSocket.OPEN) {
+                    client.send(stringify({topic, payload}));
                 }
             }
         }
